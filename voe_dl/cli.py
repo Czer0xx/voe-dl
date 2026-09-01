@@ -79,8 +79,9 @@ def main():
         list_dl(args.target, args)
     else:
         print("[*] Press Ctrl+C to abort download")
+        result = False
         try:
-            download(args.target, args, _global_stop_event)
+            result = download(args.target, args, _global_stop_event)
         except KeyboardInterrupt:
             print("\n[!] KeyboardInterrupt - Aborting download...")
             _global_stop_event.set()
@@ -95,8 +96,10 @@ def main():
 
                 # Ask user what to do with partial downloads
                 prompt_partial_file_cleanup()
-            else:
-                # Normal completion - clean up
+            elif result:
+                # only delete the .part file if the download succeeded
                 if not PIPED:
                     print("[*] Cleaning up temporary files...")
                 delpartfiles()
+            else:
+                print("[!] Download did not complete successfully - keeping .part file so it can be resumed.")
