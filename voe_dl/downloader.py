@@ -19,6 +19,17 @@ from voe_dl.piping import PIPED, flush_piped_link
 from voe_dl.sources import SOURCE_METHODS
 from voe_dl.sources.iframe_fallback import find_iframe_url
 
+# yt-dlp retries a dropped connection this many times before giving up
+STREAM_RETRY_COUNT = 10
+
+
+def _retry_backoff(retry_count):
+    """Seconds to sleep before the next retry, capped at 30s."""
+    return min(2 ** retry_count, 30)
+
+
+STREAM_RETRY_SLEEP_FUNCTIONS = {'http': _retry_backoff, 'fragment': _retry_backoff}
+
 
 def list_dl(doc, args):
     """
@@ -48,6 +59,8 @@ def list_dl(doc, args):
 
     future_to_link = {}
     executor = None
+    success_count = 0
+    failed_count = 0
 
     try:
         # Execute parallel downloads
@@ -68,8 +81,6 @@ def list_dl(doc, args):
         # Poll futures with timeout to allow KeyboardInterrupt
         completed = set()
         total = len(futures)
-        success_count = 0
-        failed_count = 0
 
         while len(completed) < total and not _global_stop_event.is_set():
             # Use as_completed with very short timeout
@@ -82,11 +93,15 @@ def list_dl(doc, args):
             # Process completed futures
             for future in done:
                 try:
-                    future.result(timeout=0)
+                    result = future.result(timeout=0)
                     completed.add(future)
-                    success_count += 1
-                    print(f"[*] Download {success_count} / {total} completed successfully.")
-                    print(f"[*] Link: '{future_to_link[future]}'")
+                    if result:
+                        success_count += 1
+                        print(f"[*] Download {success_count} / {total} completed successfully.")
+                        print(f"[*] Link: '{future_to_link[future]}'")
+                    else:
+                        failed_count += 1
+                        print(f"[!] Download failed (failed {failed_count}): {future_to_link[future]}")
                 except concurrent.futures.CancelledError:
                     # Future was cancelled due to abort - this is expected
                     completed.add(future)
@@ -129,9 +144,12 @@ def list_dl(doc, args):
             else:
                 # Normal shutdown - wait for completion
                 executor.shutdown(wait=True)
-                # Clean up after successful completion
-                print("[*] Cleaning up temporary files...")
-                delpartfiles()
+                # only delete .part files if nothing failed
+                if failed_count == 0:
+                    print("[*] Cleaning up temporary files...")
+                    delpartfiles()
+                else:
+                    print(f"[!] {failed_count} download(s) failed - keeping .part files so they can be resumed.")
 
 
 def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
@@ -146,17 +164,17 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
     # Check if abort was requested before starting
     if stop_event and stop_event.is_set():
         print(f"[!] Download aborted before starting: {url}")
-        return
+        return False
 
     URL = str(url)
     if visited_urls is None:
         visited_urls = set()
     if URL in visited_urls:
         print(f"[!] Redirect loop detected, already visited: {URL}")
-        return
+        return False
     if redirect_depth > 10:
         print(f"[!] Too many redirects while resolving: {URL}")
-        return
+        return False
     visited_urls.add(URL)
     custom_name = args.name if hasattr(args, 'name') else None
     dry_run = args.dry_run if hasattr(args, 'dry_run') else False
@@ -175,7 +193,7 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
         # Check abort before making request
         if stop_event and stop_event.is_set():
             print(f"[!] Download aborted: {url}")
-            return
+            return False
 
         # Use the session for persistent cookies
         html_page = session.get(URL, headers=headers, timeout=30)
@@ -274,7 +292,7 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
             with open(f"debug_page_{int(time.time())}.html", "w", encoding="utf-8") as f:
                 f.write(html_page.text)
             print(f"[*] Page content saved for debugging")
-            return
+            return False
 
         # Process the found sources
         try:
@@ -308,16 +326,17 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
 
                 if PIPED:
                     flush_piped_link(link)
-                    return
+                    return True
 
                 # Check for abort before starting download
                 if stop_event and stop_event.is_set():
                     print(f"[!] Download aborted before starting MP4 download: {URL}")
-                    return
+                    return False
 
                 print(f"[*] Downloading MP4 stream: {link}")
                 if dry_run:
                     print(f"[Dry Run] Would download: {link} to {name}")
+                    return True
                 else:
                     # Progress hook to check for abort
                     def progress_hook(d):
@@ -331,10 +350,14 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
                         'http_headers': headers,
                         'progress_hooks': [progress_hook],
                         'proxy': args.proxy,
+                        'retries': STREAM_RETRY_COUNT,
+                        'fragment_retries': STREAM_RETRY_COUNT,
+                        'retry_sleep_functions': STREAM_RETRY_SLEEP_FUNCTIONS,
                     }
                     with YoutubeDL(ydl_opts) as ydl:
                         try:
                             ydl.download([link])
+                            return True
                         except DownloadAbortedException:
                             # Re-raise abort exception to be handled by caller
                             raise
@@ -342,8 +365,9 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
                             # Check if it was aborted
                             if stop_event and stop_event.is_set():
                                 print(f"[!] Download aborted during MP4 download: {URL}")
-                                return
+                                return False
                             print(f"[!] YoutubeDL error: {e}")
+                            return False
             elif "hls" in source_json:
                 link = source_json["hls"]
                 # Check if the link is base64 encoded
@@ -365,16 +389,17 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
 
                 if PIPED:
                     flush_piped_link(link)
-                    return
+                    return True
 
                 # Check for abort before starting download
                 if stop_event and stop_event.is_set():
                     print(f"[!] Download aborted before starting HLS download: {URL}")
-                    return
+                    return False
 
                 print(f"[*] Downloading HLS stream: {link}")
                 if dry_run:
                     print(f"[Dry Run] Would download: {link} to {name}")
+                    return True
                 else:
                     # Progress hook to check for abort
                     def progress_hook(d):
@@ -388,10 +413,14 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
                         'http_headers': headers,
                         'progress_hooks': [progress_hook],
                         'proxy': args.proxy,
+                        'retries': STREAM_RETRY_COUNT,
+                        'fragment_retries': STREAM_RETRY_COUNT,
+                        'retry_sleep_functions': STREAM_RETRY_SLEEP_FUNCTIONS,
                     }
                     with YoutubeDL(ydl_opts) as ydl:
                         try:
                             ydl.download([link])
+                            return True
                         except DownloadAbortedException:
                             # Re-raise abort exception to be handled by caller
                             raise
@@ -399,21 +428,27 @@ def download(url, args, stop_event=None, visited_urls=None, redirect_depth=0):
                             # Check if it was aborted
                             if stop_event and stop_event.is_set():
                                 print(f"[!] Download aborted during HLS download: {URL}")
-                                return
+                                return False
                             print(f"[!] YoutubeDL error: {e}")
+                            return False
             else:
                 print("[!] Could not find downloadable URL. The site might have changed.")
                 print(f"Available keys in source_json: {list(source_json.keys())}")
                 for key, value in source_json.items():
                     print(f"{key}: {value}")
+                return False
         except KeyError as e:
             print(f"[!] KeyError: {e}")
             print("[!] Could not find downloadable URL. The site might have changed.")
             print(f"Available keys in source_json: {list(source_json.keys())}")
+            return False
 
     except requests.exceptions.RequestException as e:
         print(f"[!] Request error: {e}")
+        return False
     except Exception as e:
         print(f"[!] Unexpected error: {e}")
+        return False
 
     print("\n")
+    return False
